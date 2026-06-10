@@ -1,1 +1,0 @@
-FROM registry.zepto.co.in/hardened-images/multi-arch/harden-node_22-alpine
