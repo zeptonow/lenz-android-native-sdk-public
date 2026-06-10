@@ -1,0 +1,1 @@
+/Users/kunaldas/.local/bin/trivy fs --list-all-pkgs --scanners=misconfig,vuln,secret,license --severity=CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN --format=json --output=/Users/kunaldas/Library/Caches/JetBrains/GoLand2024.3/Trivy/trivy-185bb11a-cd3d-42d4-838d-45c13396221d.json /Users/kunaldas/Documents/lenz-android-native-sdk-public
