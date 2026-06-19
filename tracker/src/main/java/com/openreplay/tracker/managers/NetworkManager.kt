@@ -47,6 +47,42 @@ object NetworkManager {
     private var writeToFile = false
     private lateinit var appContext: Context
 
+    private const val MAX_IMAGE_UPLOAD_RETRIES = 5
+    private const val IMAGE_UPLOAD_BACKOFF_BASE_MS = 1000L
+
+    private data class ImageUploadRetryState(
+        var failureCount: Int = 0,
+        var nextRetryAtMs: Long = 0L
+    )
+
+    private val imageUploadRetryStates = mutableMapOf<String, ImageUploadRetryState>()
+    private val imageUploadRetryLock = Any()
+
+    private fun shouldSkipImageUpload(name: String): Boolean {
+        synchronized(imageUploadRetryLock) {
+            val state = imageUploadRetryStates[name] ?: return false
+            if (state.failureCount >= MAX_IMAGE_UPLOAD_RETRIES) return true
+            return System.currentTimeMillis() < state.nextRetryAtMs
+        }
+    }
+
+    private fun recordImageUploadFailure(name: String) {
+        synchronized(imageUploadRetryLock) {
+            val state = imageUploadRetryStates.getOrPut(name) { ImageUploadRetryState() }
+            state.failureCount++
+            if (state.failureCount < MAX_IMAGE_UPLOAD_RETRIES) {
+                val backoffMs = IMAGE_UPLOAD_BACKOFF_BASE_MS * (1L shl (state.failureCount - 1))
+                state.nextRetryAtMs = System.currentTimeMillis() + backoffMs
+            }
+        }
+    }
+
+    private fun clearImageUploadRetryState(name: String) {
+        synchronized(imageUploadRetryLock) {
+            imageUploadRetryStates.remove(name)
+        }
+    }
+
     fun initialize(context: Context) {
         appContext = context.applicationContext // Avoid memory leaks
     }
@@ -412,6 +448,11 @@ object NetworkManager {
         completion: (Boolean) -> Unit
     ) {
         networkScope.launch {
+            if (shouldSkipImageUpload(name)) {
+                withContext(Dispatchers.Main) { completion(false) }
+                return@launch
+            }
+
             val token = this@NetworkManager.token ?: run {
                 DebugUtils.error("No token available for sendImages.")
                 withContext(Dispatchers.Main) { completion(false) }
@@ -445,14 +486,17 @@ object NetworkManager {
 
                 val responseCode = request.responseCode
                 if (responseCode in 200..299) {
+                    clearImageUploadRetryState(name)
                     DebugUtils.log("Images sent successfully")
                     withContext(Dispatchers.Main) { completion(true) }
                 } else {
                     val errorBody = readErrorStream(request)
+                    recordImageUploadFailure(name)
                     DebugUtils.error("Failed to send images: $responseCode - $errorBody")
                     withContext(Dispatchers.Main) { completion(false) }
                 }
             } catch (e: Exception) {
+                recordImageUploadFailure(name)
                 DebugUtils.error("Error sending images: ${e.message}")
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
