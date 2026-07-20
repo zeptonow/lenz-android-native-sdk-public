@@ -60,7 +60,7 @@ object NetworkManager {
     private var writeToFile = false
     private lateinit var appContext: Context
 
-    private const val MAX_IMAGE_UPLOAD_RETRIES = 3
+    private const val MAX_IMAGE_UPLOAD_RETRIES = 5
     private const val IMAGE_UPLOAD_BACKOFF_BASE_MS = 1000L
 
     private data class ImageUploadRetryState(
