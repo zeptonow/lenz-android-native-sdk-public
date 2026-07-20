@@ -60,7 +60,7 @@ object NetworkManager {
     private var writeToFile = false
     private lateinit var appContext: Context
 
-    private const val MAX_IMAGE_UPLOAD_RETRIES = 5
+    private const val MAX_IMAGE_UPLOAD_RETRIES = 3
     private const val IMAGE_UPLOAD_BACKOFF_BASE_MS = 1000L
 
     private data class ImageUploadRetryState(
@@ -93,6 +93,29 @@ object NetworkManager {
     private fun clearImageUploadRetryState(name: String) {
         synchronized(imageUploadRetryLock) {
             imageUploadRetryStates.remove(name)
+        }
+    }
+
+    private fun handleImageUploadFailure(name: String, archive: File) {
+        recordImageUploadFailure(name)
+        val retriesExhausted = synchronized(imageUploadRetryLock) {
+            (imageUploadRetryStates[name]?.failureCount ?: 0) >= MAX_IMAGE_UPLOAD_RETRIES
+        }
+        if (!retriesExhausted) {
+            return
+        }
+        clearImageUploadRetryState(name)
+        if (!archive.exists()) {
+            return
+        }
+        if (archive.delete()) {
+            DebugUtils.log(
+                "Deleted archive after $MAX_IMAGE_UPLOAD_RETRIES failed uploads: $name"
+            )
+        } else {
+            DebugUtils.error(
+                "Failed to delete archive after $MAX_IMAGE_UPLOAD_RETRIES failed uploads: $name"
+            )
         }
     }
 
@@ -542,11 +565,11 @@ object NetworkManager {
                         DebugUtils.log("Images sent successfully")
                     } else {
                         val errorBody = readErrorStream(request)
-                        recordImageUploadFailure(name)
+                        handleImageUploadFailure(name, images)
                         DebugUtils.error("Failed to send images: $responseCode - $errorBody")
                     }
                 } catch (e: Exception) {
-                    recordImageUploadFailure(name)
+                    handleImageUploadFailure(name, images)
                     DebugUtils.error("Error sending images: ${e.message}")
                 } finally {
                     request?.disconnect()
