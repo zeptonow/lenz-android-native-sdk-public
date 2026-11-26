@@ -40,6 +40,10 @@ object NetworkManager {
     private const val IMAGE_BACKOFF_BASE_MS = 1_000L
     private const val IMAGE_BACKOFF_CAP_MS = 30_000L
 
+    // Skip uploading image archives larger than this. The archive can never be
+    // ingested if it is over the limit, so we drop it instead of retrying forever.
+    private const val MAX_IMAGE_UPLOAD_SIZE_BYTES = 5L * 1024 * 1024 // 5 MB
+
     private val networkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val imageUploadSemaphore = Semaphore(IMAGE_UPLOAD_MAX_CONCURRENCY)
     private val consecutiveImageFailures = AtomicInteger(0)
@@ -95,6 +99,15 @@ object NetworkManager {
             imageUploadRetryStates.remove(name)
         }
     }
+
+    /**
+     * True when the archive exceeds the upload size limit and must not be sent.
+     * Uses [File.length] (a single filesystem stat) so it is safe to call on the
+     * hot path. A missing file reports length 0 and is therefore not "too large".
+     * Visible for testing.
+     */
+    internal fun isImageArchiveTooLarge(archive: File): Boolean =
+        archive.length() > MAX_IMAGE_UPLOAD_SIZE_BYTES
 
     private fun handleImageUploadFailure(name: String, archive: File) {
         recordImageUploadFailure(name)
@@ -515,6 +528,19 @@ object NetworkManager {
     ) {
         networkScope.launch {
             if (shouldSkipImageUpload(name)) {
+                withContext(Dispatchers.Main) { completion(false) }
+                return@launch
+            }
+
+            // Cheap filesystem stat (single syscall, no I/O on contents). Reject
+            // oversized archives before touching the network or the upload semaphore.
+            // The archive is deleted so it is not re-enumerated and re-checked forever.
+            if (isImageArchiveTooLarge(images)) {
+                DebugUtils.error(
+                    "Skipping image upload: archive $name is ${images.length()} bytes " +
+                        "(>$MAX_IMAGE_UPLOAD_SIZE_BYTES limit)"
+                )
+                if (images.exists()) runCatching { images.delete() }
                 withContext(Dispatchers.Main) { completion(false) }
                 return@launch
             }
