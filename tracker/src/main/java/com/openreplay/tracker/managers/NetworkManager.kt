@@ -40,9 +40,13 @@ object NetworkManager {
     private const val IMAGE_BACKOFF_BASE_MS = 1_000L
     private const val IMAGE_BACKOFF_CAP_MS = 30_000L
 
+    const val DEFAULT_MAX_IMAGE_UPLOAD_SIZE_BYTES = 5L * 1024 * 1024 // 5 MB
+
     // Skip uploading image archives larger than this. The archive can never be
     // ingested if it is over the limit, so we drop it instead of retrying forever.
-    private const val MAX_IMAGE_UPLOAD_SIZE_BYTES = 5L * 1024 * 1024 // 5 MB
+    // Configured by the client via OROptions.maxImageArchiveSizeBytes at SDK start.
+    @Volatile
+    var maxImageUploadSizeBytes: Long = DEFAULT_MAX_IMAGE_UPLOAD_SIZE_BYTES
 
     private val networkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val imageUploadSemaphore = Semaphore(IMAGE_UPLOAD_MAX_CONCURRENCY)
@@ -107,7 +111,7 @@ object NetworkManager {
      * Visible for testing.
      */
     internal fun isImageArchiveTooLarge(archive: File): Boolean =
-        archive.length() > MAX_IMAGE_UPLOAD_SIZE_BYTES
+        archive.length() > maxImageUploadSizeBytes
 
     private fun handleImageUploadFailure(name: String, archive: File) {
         recordImageUploadFailure(name)
@@ -538,7 +542,7 @@ object NetworkManager {
             if (isImageArchiveTooLarge(images)) {
                 DebugUtils.error(
                     "Skipping image upload: archive $name is ${images.length()} bytes " +
-                        "(>$MAX_IMAGE_UPLOAD_SIZE_BYTES limit)"
+                        "(>$maxImageUploadSizeBytes limit)"
                 )
                 if (images.exists()) runCatching { images.delete() }
                 withContext(Dispatchers.Main) { completion(false) }

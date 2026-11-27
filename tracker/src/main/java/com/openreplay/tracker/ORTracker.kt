@@ -95,6 +95,7 @@ object OpenReplay {
         this.appContext = appContext
         this.options = options
         this.projectKey = projectKey
+        NetworkManager.maxImageUploadSizeBytes = options.maxImageArchiveSizeBytes
 
         // Initialize LifecycleManager immediately to capture current activity
         if (this.lifecycleManager == null) {
@@ -226,6 +227,7 @@ object OpenReplay {
         this.appContext = appContext
         this.options = options
         this.projectKey = projectKey
+        NetworkManager.maxImageUploadSizeBytes = options.maxImageArchiveSizeBytes
         this.bufferingMode = true
         sessionStartTs = Date().time
 
