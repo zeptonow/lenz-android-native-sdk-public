@@ -23,6 +23,8 @@ enum class RecordingQuality {
  * @property screenshotFrequency Frequency of screenshot capture (default: Low)
  * @property screenshotQuality Quality of screenshot capture (default: Low)
  * @property pkgVersion Package version for tracking (default: "1.0.10")
+ * @property maxImageArchiveSizeBytes Max size (in bytes) of a screenshot archive that will be
+ *   uploaded; archives larger than this are skipped (default: 5 MB, must be > 0)
  */
 data class OROptions(
     val crashes: Boolean = true,
@@ -36,11 +38,15 @@ data class OROptions(
     val fps: Int = 1,
     val screenshotFrequency: RecordingFrequency = RecordingFrequency.Low,
     val screenshotQuality: RecordingQuality = RecordingQuality.Low,
-    val pkgVersion: String = "1.0.10"
+    val pkgVersion: String = "1.0.10",
+    val maxImageArchiveSizeBytes: Long = DEFAULT_MAX_IMAGE_ARCHIVE_SIZE_BYTES
 ) {
     init {
         require(fps > 0) { "fps must be positive, got: $fps" }
         require(pkgVersion.isNotBlank()) { "pkgVersion cannot be blank" }
+        require(maxImageArchiveSizeBytes > 0) {
+            "maxImageArchiveSizeBytes must be positive, got: $maxImageArchiveSizeBytes"
+        }
     }
 
     /**
@@ -68,6 +74,7 @@ data class OROptions(
         val defaults = OROptions()
         
         private const val DEFAULT_PKG_VERSION = "1.0.10"
+        const val DEFAULT_MAX_IMAGE_ARCHIVE_SIZE_BYTES = 5L * 1024 * 1024 // 5 MB
         
         fun builder(): Builder = Builder()
     }
@@ -85,6 +92,7 @@ data class OROptions(
         private var screenshotFrequency: RecordingFrequency = RecordingFrequency.Low
         private var screenshotQuality: RecordingQuality = RecordingQuality.Low
         private var pkgVersion: String = DEFAULT_PKG_VERSION
+        private var maxImageArchiveSizeBytes: Long = DEFAULT_MAX_IMAGE_ARCHIVE_SIZE_BYTES
 
         fun crashes(value: Boolean) = apply { this.crashes = value }
         fun analytics(value: Boolean) = apply { this.analytics = value }
@@ -98,6 +106,7 @@ data class OROptions(
         fun screenshotFrequency(value: RecordingFrequency) = apply { this.screenshotFrequency = value }
         fun screenshotQuality(value: RecordingQuality) = apply { this.screenshotQuality = value }
         fun pkgVersion(value: String) = apply { this.pkgVersion = value }
+        fun maxImageArchiveSizeBytes(value: Long) = apply { this.maxImageArchiveSizeBytes = value }
 
         fun build() = OROptions(
             crashes = crashes,
@@ -111,7 +120,8 @@ data class OROptions(
             fps = fps,
             screenshotFrequency = screenshotFrequency,
             screenshotQuality = screenshotQuality,
-            pkgVersion = pkgVersion
+            pkgVersion = pkgVersion,
+            maxImageArchiveSizeBytes = maxImageArchiveSizeBytes
         )
     }
 }
