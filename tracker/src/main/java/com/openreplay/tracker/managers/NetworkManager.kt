@@ -10,13 +10,18 @@ import com.google.gson.reflect.TypeToken
 import com.openreplay.tracker.OpenReplay
 import com.openreplay.tracker.models.SessionResponse
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPOutputStream
 
 object NetworkManager {
@@ -30,8 +35,16 @@ object NetworkManager {
     private const val THREAD_STATS_TAG = 1000
     private const val CONNECT_TIMEOUT_MS = 30000 // 30 seconds
     private const val READ_TIMEOUT_MS = 30000 // 30 seconds
-    
+
+    private const val IMAGE_UPLOAD_MAX_CONCURRENCY = 2
+    private const val IMAGE_BACKOFF_BASE_MS = 1_000L
+    private const val IMAGE_BACKOFF_CAP_MS = 30_000L
+
     private val networkScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val imageUploadSemaphore = Semaphore(IMAGE_UPLOAD_MAX_CONCURRENCY)
+    private val consecutiveImageFailures = AtomicInteger(0)
+    @Volatile
+    private var imageBackoffUntilMs = 0L
 
     var baseUrl = "https://api.openreplay.com/ingest"
 
@@ -83,6 +96,29 @@ object NetworkManager {
         }
     }
 
+    private fun handleImageUploadFailure(name: String, archive: File) {
+        recordImageUploadFailure(name)
+        val retriesExhausted = synchronized(imageUploadRetryLock) {
+            (imageUploadRetryStates[name]?.failureCount ?: 0) >= MAX_IMAGE_UPLOAD_RETRIES
+        }
+        if (!retriesExhausted) {
+            return
+        }
+        clearImageUploadRetryState(name)
+        if (!archive.exists()) {
+            return
+        }
+        if (archive.delete()) {
+            DebugUtils.log(
+                "Deleted archive after $MAX_IMAGE_UPLOAD_RETRIES failed uploads: $name"
+            )
+        } else {
+            DebugUtils.error(
+                "Failed to delete archive after $MAX_IMAGE_UPLOAD_RETRIES failed uploads: $name"
+            )
+        }
+    }
+
     fun initialize(context: Context) {
         appContext = context.applicationContext // Avoid memory leaks
     }
@@ -99,12 +135,25 @@ object NetworkManager {
         path: String,
         body: ByteArray? = null,
         headers: Map<String, String>? = null
+    ): HttpURLConnection = createRequest(
+        method = method,
+        path = path,
+        contentLength = body?.size?.toLong(),
+        bodyWriter = body?.let { bytes -> { os: OutputStream -> os.write(bytes) } },
+        headers = headers,
+    )
+
+    private suspend fun createRequest(
+        method: String,
+        path: String,
+        contentLength: Long?,
+        bodyWriter: ((OutputStream) -> Unit)?,
+        headers: Map<String, String>?
     ): HttpURLConnection = withContext(Dispatchers.IO) {
         val url = URL(baseUrl + path)
         val connection = url.openConnection() as HttpURLConnection
 
         try {
-            // Tag the thread for network usage tracking
             TrafficStats.setThreadStatsTag(THREAD_STATS_TAG)
 
             connection.requestMethod = method
@@ -113,22 +162,20 @@ object NetworkManager {
             connection.connectTimeout = CONNECT_TIMEOUT_MS
             connection.readTimeout = READ_TIMEOUT_MS
 
-            // Add headers to the connection
             headers?.forEach { (key, value) -> connection.setRequestProperty(key, value) }
 
-            // Add body if it's a POST/PUT request
-            if (body != null) {
+            if (bodyWriter != null && contentLength != null) {
                 connection.doOutput = true
-                connection.setRequestProperty("Content-Length", body.size.toString())
-                connection.outputStream.use { outputStream ->
-                    outputStream.write(body)
+                connection.setFixedLengthStreamingMode(contentLength)
+                BufferedOutputStream(connection.outputStream).use { outputStream ->
+                    bodyWriter(outputStream)
+                    outputStream.flush()
                 }
             }
         } catch (e: Exception) {
-            connection.disconnect() // Disconnect in case of failure
+            connection.disconnect()
             throw e
         } finally {
-            // Clear the thread's TrafficStats tag
             TrafficStats.clearThreadStatsTag()
         }
 
@@ -412,38 +459,57 @@ object NetworkManager {
         }
     }
 
-    private fun buildMultipartBody(
+    private data class MultipartParts(
+        val formHeaders: List<ByteArray>,
+        val fileHeader: ByteArray,
+        val file: File,
+        val fileTrailer: ByteArray,
+        val closing: ByteArray,
+    ) {
+        // Capture the length once so it matches what writeTo() streams below; the
+        // archive file is immutable once created, so this stays consistent.
+        private val fileLength: Long = file.length()
+
+        val contentLength: Long =
+            formHeaders.sumOf { it.size.toLong() } +
+                fileHeader.size.toLong() +
+                fileLength +
+                fileTrailer.size.toLong() +
+                closing.size.toLong()
+
+        fun writeTo(out: OutputStream) {
+            formHeaders.forEach { out.write(it) }
+            out.write(fileHeader)
+            // Stream the archive straight from disk; never hold it fully in memory.
+            file.inputStream().use { it.copyTo(out) }
+            out.write(fileTrailer)
+            out.write(closing)
+        }
+    }
+
+    private fun buildMultipartParts(
         boundary: String,
         formFields: Map<String, String>,
-        fileField: Pair<String, Pair<String, ByteArray>>
-    ): ByteArray {
-        val outputStream = ByteArrayOutputStream()
-        val writer = outputStream.bufferedWriter()
-
-        // Write form fields
-        formFields.forEach { (name, value) ->
-            writer.write("--$boundary\r\n")
-            writer.write("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
-            writer.write("$value\r\n")
+        fileFieldName: String,
+        fileName: String,
+        file: File,
+    ): MultipartParts {
+        val formHeaders = formFields.map { (name, value) ->
+            ("--$boundary\r\n" +
+                "Content-Disposition: form-data; name=\"$name\"\r\n\r\n" +
+                "$value\r\n").toByteArray(Charsets.UTF_8)
         }
-
-        // Write file field
-        val (fileName, fileData) = fileField.second
-        writer.write("--$boundary\r\n")
-        writer.write("Content-Disposition: form-data; name=\"${fileField.first}\"; filename=\"$fileName\"\r\n")
-        writer.write("Content-Type: application/gzip\r\n\r\n")
-        writer.flush()
-        outputStream.write(fileData)
-        writer.write("\r\n")
-        writer.write("--$boundary--\r\n")
-        writer.flush()
-
-        return outputStream.toByteArray()
+        val fileHeader = ("--$boundary\r\n" +
+            "Content-Disposition: form-data; name=\"$fileFieldName\"; filename=\"$fileName\"\r\n" +
+            "Content-Type: application/gzip\r\n\r\n").toByteArray(Charsets.UTF_8)
+        val fileTrailer = "\r\n".toByteArray(Charsets.UTF_8)
+        val closing = "--$boundary--\r\n".toByteArray(Charsets.UTF_8)
+        return MultipartParts(formHeaders, fileHeader, file, fileTrailer, closing)
     }
 
     fun sendImages(
         projectKey: String,
-        images: ByteArray,
+        images: File,
         name: String,
         completion: (Boolean) -> Unit
     ) {
@@ -465,42 +531,60 @@ object NetworkManager {
                 return@launch
             }
 
-            var request: HttpURLConnection? = null
-            try {
-                val boundary = "Boundary-${UUID.randomUUID()}"
-                val requestBody = buildMultipartBody(
-                    boundary,
-                    formFields = mapOf("projectKey" to projectKey),
-                    fileField = "batch" to Pair(name, images)
-                )
+            imageUploadSemaphore.withPermit {
+                val waitMs = imageBackoffUntilMs - System.currentTimeMillis()
+                if (waitMs > 0) delay(waitMs)
 
-                request = createRequest(
-                    method = "POST",
-                    path = IMAGES_URL,
-                    body = requestBody,
-                    headers = mapOf(
-                        "Authorization" to "Bearer $token",
-                        "Content-Type" to "multipart/form-data; boundary=$boundary"
+                var success = false
+                var request: HttpURLConnection? = null
+                try {
+                    val boundary = "Boundary-${UUID.randomUUID()}"
+                    val parts = buildMultipartParts(
+                        boundary = boundary,
+                        formFields = mapOf("projectKey" to projectKey),
+                        fileFieldName = "batch",
+                        fileName = name,
+                        file = images,
                     )
-                )
 
-                val responseCode = request.responseCode
-                if (responseCode in 200..299) {
-                    clearImageUploadRetryState(name)
-                    DebugUtils.log("Images sent successfully")
-                    withContext(Dispatchers.Main) { completion(true) }
-                } else {
-                    val errorBody = readErrorStream(request)
-                    recordImageUploadFailure(name)
-                    DebugUtils.error("Failed to send images: $responseCode - $errorBody")
-                    withContext(Dispatchers.Main) { completion(false) }
+                    request = createRequest(
+                        method = "POST",
+                        path = IMAGES_URL,
+                        contentLength = parts.contentLength,
+                        bodyWriter = { os -> parts.writeTo(os) },
+                        headers = mapOf(
+                            "Authorization" to "Bearer $token",
+                            "Content-Type" to "multipart/form-data; boundary=$boundary"
+                        )
+                    )
+
+                    val responseCode = request.responseCode
+                    if (responseCode in 200..299) {
+                        success = true
+                        clearImageUploadRetryState(name)
+                        DebugUtils.log("Images sent successfully")
+                    } else {
+                        val errorBody = readErrorStream(request)
+                        handleImageUploadFailure(name, images)
+                        DebugUtils.error("Failed to send images: $responseCode - $errorBody")
+                    }
+                } catch (e: Exception) {
+                    handleImageUploadFailure(name, images)
+                    DebugUtils.error("Error sending images: ${e.message}")
+                } finally {
+                    request?.disconnect()
+                    if (success) {
+                        consecutiveImageFailures.set(0)
+                        imageBackoffUntilMs = 0L
+                    } else {
+                        val n = consecutiveImageFailures.incrementAndGet()
+                        val shift = (n - 1).coerceIn(0, 5)
+                        val backoff = (IMAGE_BACKOFF_BASE_MS shl shift).coerceAtMost(IMAGE_BACKOFF_CAP_MS)
+                        imageBackoffUntilMs = System.currentTimeMillis() + backoff
+                        DebugUtils.log("Image upload backoff ${backoff}ms after $n consecutive failure(s)")
+                    }
+                    withContext(Dispatchers.Main) { completion(success) }
                 }
-            } catch (e: Exception) {
-                recordImageUploadFailure(name)
-                DebugUtils.error("Error sending images: ${e.message}")
-                withContext(Dispatchers.Main) { completion(false) }
-            } finally {
-                request?.disconnect()
             }
         }
     }
